@@ -27,6 +27,7 @@
 
 import argparse
 import os, re
+import shlex
 from subprocess import PIPE, Popen
 from sys import exit
 
@@ -43,7 +44,7 @@ args = parser.parse_args()
 if args.verbose:
     print(args)
 
-env = os.environ
+env = os.environ.copy()
 env_sep = ';' if args.os == 'WIN32' else ':'
 
 def add_env(k, v):
@@ -80,8 +81,7 @@ elif args.os == 'LINUX_CROSS_ANDROID':
         add_env(k, v.replace("\\\"", "\""))
 
 # build command-line
-cmd_exec, cmd_args = args.args[0], ' '.join(args.args[1:])
-cmd_line = f'"{cmd_exec}" {cmd_args} || exit $?'
+cmd_line = shlex.join(args.args)
 
 if args.verbose:
     print(f'Built cmd_line = "{cmd_line}"')
@@ -89,10 +89,10 @@ if args.verbose:
 proc = None
 if args.os == 'WIN32':
     # we must emulate a UNIX environment to build openssl using mingw
-    proc = Popen(bash, env=env, cwd=args.cwd, stdin=PIPE, universal_newlines=True)
+    proc = Popen(args.bash, env=env, cwd=args.cwd, stdin=PIPE, universal_newlines=True)
     proc.communicate(input=cmd_line)
 else:
-    proc = Popen(cmd_line, env=env, cwd=args.cwd, shell=True)
+    proc = Popen(args.args, env=env, cwd=args.cwd)
     proc.communicate()
 
 exit(proc.returncode)

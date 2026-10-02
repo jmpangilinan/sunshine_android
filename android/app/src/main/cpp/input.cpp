@@ -23,8 +23,10 @@ extern "C" {
 #include "config.h"
 #include "globals.h"
 #include "input.h"
+#include "input_state.h"
 #include "logging.h"
 #include "platform/common.h"
+#include "platform/android/input_bridge.h"
 #include "thread_pool.h"
 #include "utility.h"
 
@@ -33,7 +35,6 @@ extern "C" {
   #define WHEEL_DELTA 120
 #endif
 
-#include "sunshine.h"
 
 using namespace std::literals;
 
@@ -59,8 +60,11 @@ namespace input {
     UP  ///< Button is up
   };
 
+  std::mutex gamepad_mask_lock;
+
   template<std::size_t N>
   int alloc_id(std::bitset<N> &gamepad_mask) {
+    std::lock_guard<std::mutex> lock(gamepad_mask_lock);
     for (int x = 0; x < gamepad_mask.size(); ++x) {
       if (!gamepad_mask[x]) {
         gamepad_mask[x] = true;
@@ -73,6 +77,7 @@ namespace input {
 
   template<std::size_t N>
   void free_id(std::bitset<N> &gamepad_mask, int id) {
+    std::lock_guard<std::mutex> lock(gamepad_mask_lock);
     gamepad_mask[id] = false;
   }
 
@@ -110,19 +115,14 @@ namespace input {
     return std::clamp(from_netfloat(f), min, max);
   }
 
-  static task_pool_util::TaskPool::task_id_t key_press_repeat_id {};
-  static std::unordered_map<key_press_id_t, bool> key_press {};
-  static std::array<std::uint8_t, 5> mouse_press {};
+  using key_press_state_t = state::held_key_state;
 
   static platf::input_t platf_input;
   static std::bitset<platf::MAX_GAMEPADS> gamepadMask {};
 
   void free_gamepad(platf::input_t &platf_input, int id) {
-// TODO(Lori): Implement this, May Android can support this in the future.
-#ifndef __ANDROID__
     platf::gamepad_update(platf_input, id, platf::gamepad_state_t {});
     platf::free_gamepad(platf_input, id);
-#endif
 
     free_id(gamepadMask, id);
   }
@@ -135,17 +135,12 @@ namespace input {
         back_button_state {button_state_e::NONE} {
     }
 
-    ~gamepad_t() {
-      if (id >= 0) {
-        task_pool.push([id = this->id]() {
-          free_gamepad(platf_input, id);
-        });
-      }
-    }
+    ~gamepad_t() = default;
 
     platf::gamepad_state_t gamepad_state;
 
     thread_pool_util::ThreadPool::task_id_t back_timeout_id;
+    thread_pool_util::ThreadPool::task_id_t home_release_id {};
 
     int id;
 
@@ -179,6 +174,20 @@ namespace input {
         accumulated_vscroll_delta {},
         accumulated_hscroll_delta {} {
     }
+    ~input_t() {
+      task_pool.cancel(key_press_repeat_id);
+      task_pool.cancel(mouse_left_button_timeout);
+      for (auto &gamepad : gamepads) {
+        task_pool.cancel(gamepad.back_timeout_id);
+        task_pool.cancel(gamepad.home_release_id);
+        if (gamepad.id >= 0) free_gamepad(platf_input, gamepad.id);
+      }
+    }
+
+    std::recursive_mutex dispatch_lock;
+    task_pool_util::TaskPool::task_id_t key_press_repeat_id {};
+    std::unordered_map<key_press_id_t, key_press_state_t> key_press;
+    std::array<uint8_t, 6> mouse_press {};
 
     // Keep track of alt+ctrl+shift key combo
     int shortcutFlags;
@@ -189,8 +198,7 @@ namespace input {
     safe::mail_raw_t::event_t<input::touch_port_t> touch_port_event;
     platf::feedback_queue_t feedback_queue;
 
-    std::list<std::vector<uint8_t>> input_queue;
-    std::mutex input_queue_lock;
+    state::ordered_queue input_queue;
 
     thread_pool_util::ThreadPool::task_id_t mouse_left_button_timeout;
 
@@ -567,13 +575,12 @@ namespace input {
 
     auto release = util::endian::little(packet->header.magic) == MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5;
     auto button = util::endian::big(packet->button);
-    if (button > 0 && button < mouse_press.size()) {
-      if (mouse_press[button] != release) {
-        // button state is already what we want
+    if (button > 0 && button < input->mouse_press.size()) {
+      if (input->mouse_press[button] != release) {
         return;
       }
 
-      mouse_press[button] = !release;
+      input->mouse_press[button] = !release;
     }
     /**
      * When Moonlight sends mouse input through absolute coordinates,
@@ -590,15 +597,18 @@ namespace input {
      * when the last mouse coordinates were absolute
      */
     if (button == BUTTON_LEFT && release && !input->mouse_left_button_timeout) {
-      auto f = [=]() {
-        auto left_released = mouse_press[BUTTON_LEFT];
+      auto f = [input, release, generation = input->input_queue.generation()]() {
+        std::lock_guard<std::recursive_mutex> lock(input->dispatch_lock);
+        if (!input->input_queue.valid(generation)) return;
+        platf::android_input::scope scope(input->client_context.get());
+        auto left_released = input->mouse_press[BUTTON_LEFT];
         if (left_released) {
           // Already released left button
           return;
         }
         platf::button_mouse(platf_input, BUTTON_LEFT, release);
 
-        mouse_press[BUTTON_LEFT] = false;
+        input->mouse_press[BUTTON_LEFT] = false;
         input->mouse_left_button_timeout = nullptr;
       };
 
@@ -613,7 +623,7 @@ namespace input {
       platf::button_mouse(platf_input, BUTTON_RIGHT, false);
       platf::button_mouse(platf_input, BUTTON_RIGHT, true);
 
-      mouse_press[BUTTON_RIGHT] = false;
+      input->mouse_press[BUTTON_RIGHT] = false;
 
       return;
     }
@@ -682,7 +692,7 @@ namespace input {
     }
   }
 
-  void send_key_and_modifiers(uint16_t key_code, bool release, uint8_t flags, uint8_t synthetic_modifiers) {
+  void send_key_and_modifiers(uint16_t key_code, bool release, uint8_t flags, uint8_t synthetic_modifiers, bool extended = false) {
     if (!release) {
       // Press any synthetic modifiers required for this key
       if (synthetic_modifiers & MODIFIER_SHIFT) {
@@ -696,7 +706,7 @@ namespace input {
       }
     }
 
-    platf::keyboard_update(platf_input, map_keycode(key_code), release, flags);
+    platf::keyboard_update(platf_input, map_keycode(key_code), release, flags, extended);
 
     if (!release) {
       // Raise any synthetic modifier keys we pressed
@@ -712,16 +722,17 @@ namespace input {
     }
   }
 
-  void repeat_key(uint16_t key_code, uint8_t flags, uint8_t synthetic_modifiers) {
-    // If key no longer pressed, stop repeating
-    if (!key_press[make_kpid(key_code, flags)]) {
-      key_press_repeat_id = nullptr;
+  void repeat_key(std::shared_ptr<input_t> input, uint64_t generation, uint16_t key_code, uint8_t flags, uint8_t synthetic_modifiers) {
+    std::lock_guard<std::recursive_mutex> lock(input->dispatch_lock);
+    if (!input->input_queue.valid(generation)) return;
+    auto &state = input->key_press[make_kpid(key_code, flags)];
+    if (!state.pressed) {
+      input->key_press_repeat_id = nullptr;
       return;
     }
-
-    send_key_and_modifiers(key_code, false, flags, synthetic_modifiers);
-
-    key_press_repeat_id = task_pool.pushDelayed(repeat_key, config::input.key_repeat_period, key_code, flags, synthetic_modifiers).task_id;
+    platf::android_input::scope scope(input->client_context.get());
+    send_key_and_modifiers(key_code, false, flags, synthetic_modifiers, state.extended);
+    input->key_press_repeat_id = task_pool.pushDelayed(repeat_key, config::input.key_repeat_period, input, generation, key_code, flags, synthetic_modifiers).task_id;
   }
 
   void passthrough(std::shared_ptr<input_t> &input, PNV_KEYBOARD_PACKET packet) {
@@ -747,7 +758,8 @@ namespace input {
       }
     }
 
-    auto &pressed = key_press[make_kpid(keyCode, packet->flags)];
+    auto &state = input->key_press[make_kpid(keyCode, packet->flags)];
+    auto &pressed = state.pressed;
     if (!pressed) {
       if (!release) {
         // A new key has been pressed down, we need to check for key combo's
@@ -756,12 +768,12 @@ namespace input {
           return;
         }
 
-        if (key_press_repeat_id) {
-          task_pool.cancel(key_press_repeat_id);
+        if (input->key_press_repeat_id) {
+          task_pool.cancel(input->key_press_repeat_id);
         }
 
         if (config::input.key_repeat_delay.count() > 0) {
-          key_press_repeat_id = task_pool.pushDelayed(repeat_key, config::input.key_repeat_delay, keyCode, packet->flags, synthetic_modifiers).task_id;
+          input->key_press_repeat_id = task_pool.pushDelayed(repeat_key, config::input.key_repeat_delay, input, input->input_queue.generation(), keyCode, packet->flags, synthetic_modifiers).task_id;
         }
       } else {
         // Already released
@@ -772,11 +784,11 @@ namespace input {
       return;
     }
 
-    pressed = !release;
+    state.update(!release, (packet->modifiers & MODIFIER_EXTENDED) != 0);
 
-    send_key_and_modifiers(keyCode, release, packet->flags, synthetic_modifiers);
+    send_key_and_modifiers(keyCode, release, packet->flags, synthetic_modifiers, state.extended);
 
-    update_shortcutFlags(&input->shortcutFlags, map_keycode(keyCode), release);
+    update_shortcutFlags(&input->shortcutFlags, keyCode, release);
   }
 
   /**
@@ -884,65 +896,20 @@ namespace input {
       return;
     }
 
-    sunshine_callbacks::callJavaOnTouch(packet);
-
-    //   BOOST_LOG(debug) << "处理触摸事件: 类型=" << (int)packet->eventType << ", 指针ID=" << util::endian::little(packet->pointerId);
-    //
-    //   // Convert the client normalized coordinates to touchport coordinates
-    //   auto coords = client_to_touchport(input, {from_clamped_netfloat(packet->x, 0.0f, 1.0f) * 65535.f, from_clamped_netfloat(packet->y, 0.0f, 1.0f) * 65535.f}, {65535.f, 65535.f});
-    //   if (!coords) {
-    //     BOOST_LOG(warning) << "无法转换触摸坐标，可能是触摸端口未初始化";
-    //     return;
-    //   }
-    //
-    //   BOOST_LOG(debug) << "触摸坐标转换: 原始=("
-    //                   << from_clamped_netfloat(packet->x, 0.0f, 1.0f) << ","
-    //                   << from_clamped_netfloat(packet->y, 0.0f, 1.0f) << ") -> 转换=("
-    //                   << coords->first << "," << coords->second << ")";
-    //
-    //   auto &touch_port = input->touch_port;
-    //   platf::touch_port_t abs_port {
-    //     touch_port.offset_x,
-    //     touch_port.offset_y,
-    //     touch_port.env_width,
-    //     touch_port.env_height
-    //   };
-    //
-    //   // Renormalize the coordinates
-    //   coords->first /= abs_port.width;
-    //   coords->second /= abs_port.height;
-    //
-    //   // Normalize rotation value to 0-359 degree range
-    //   auto rotation = util::endian::little(packet->rotation);
-    //   if (rotation != LI_ROT_UNKNOWN) {
-    //     rotation %= 360;
-    //   }
-    //
-    //   // Normalize the contact area based on the touchport
-    //   auto contact_area = scale_client_contact_area(
-    //     {from_clamped_netfloat(packet->contactAreaMajor, 0.0f, 1.0f) * 65535.f,
-    //      from_clamped_netfloat(packet->contactAreaMinor, 0.0f, 1.0f) * 65535.f},
-    //     rotation,
-    //     {abs_port.width / 65535.f, abs_port.height / 65535.f}
-    //   );
-    //
-    //   BOOST_LOG(debug) << "触摸区域: 主轴=" << contact_area.first << ", 次轴=" << contact_area.second
-    //                   << ", 压力=" << from_clamped_netfloat(packet->pressureOrDistance, 0.0f, 1.0f)
-    //                   << ", 旋转=" << rotation;
-    //
-    //   platf::touch_input_t touch {
-    //     packet->eventType,
-    //     rotation,
-    //     util::endian::little(packet->pointerId),
-    //     coords->first,
-    //     coords->second,
-    //     from_clamped_netfloat(packet->pressureOrDistance, 0.0f, 1.0f),
-    //     contact_area.first,
-    //     contact_area.second,
-    //   };
-    //
-    //   BOOST_LOG(debug) << "准备更新触摸状态: 最终坐标=(" << coords->first << "," << coords->second << ")";
-    //   platf::touch_update(input->client_context.get(), abs_port, touch);
+    auto coords = client_to_touchport(input, {from_clamped_netfloat(packet->x, 0.f, 1.f) * 65535.f, from_clamped_netfloat(packet->y, 0.f, 1.f) * 65535.f}, {65535.f, 65535.f});
+    if (!coords) return;
+    auto &port = input->touch_port;
+    platf::touch_port_t abs_port {port.offset_x, port.offset_y, port.env_width, port.env_height};
+    auto rotation = util::endian::little(packet->rotation);
+    if (rotation != LI_ROT_UNKNOWN) rotation %= 360;
+    auto contact = scale_client_contact_area(
+      {from_clamped_netfloat(packet->contactAreaMajor, 0.f, 1.f) * 65535.f,
+       from_clamped_netfloat(packet->contactAreaMinor, 0.f, 1.f) * 65535.f},
+      rotation, {abs_port.width / 65535.f, abs_port.height / 65535.f});
+    platf::touch_input_t touch {packet->eventType, rotation, util::endian::little(packet->pointerId),
+      coords->first / abs_port.width, coords->second / abs_port.height,
+      from_clamped_netfloat(packet->pressureOrDistance, 0.f, 1.f), contact.first, contact.second};
+    platf::touch_update(input->client_context.get(), abs_port, touch);
   }
 
   /**
@@ -1127,6 +1094,10 @@ namespace input {
       gamepad.id = id;
     } else if (!(packet->activeGamepadMask & (1 << packet->controllerNumber)) && gamepad.id >= 0) {
       // If this is the final event for a gamepad being removed, free the gamepad and return.
+      task_pool.cancel(gamepad.back_timeout_id);
+      task_pool.cancel(gamepad.home_release_id);
+      gamepad.home_release_id = nullptr;
+      gamepad.back_timeout_id = nullptr;
       free_gamepad(platf_input, gamepad.id);
       gamepad.id = -1;
       return;
@@ -1176,8 +1147,12 @@ namespace input {
       if (platf::BACK & bf_new) {
         // Don't emulate home button if timeout < 0
         if (config::input.back_button_timeout >= 0ms) {
-          auto f = [input, controller = packet->controllerNumber]() {
+          auto f = [input, controller = packet->controllerNumber, id = gamepad.id, generation = input->input_queue.generation()]() {
+            std::lock_guard<std::recursive_mutex> lock(input->dispatch_lock);
+            if (!input->input_queue.valid(generation)) return;
+            platf::android_input::scope scope(input->client_context.get());
             auto &gamepad = input->gamepads[controller];
+            if (gamepad.id != id || !gamepad.back_timeout_id) return;
 
             auto &state = gamepad.gamepad_state;
 
@@ -1190,14 +1165,17 @@ namespace input {
             state.buttonFlags |= platf::HOME;
             platf::gamepad_update(platf_input, gamepad.id, state);
 
-            // Sleep for a short time to allow the input to be detected
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-            // Release Home button
-            state.buttonFlags &= ~platf::HOME;
-            platf::gamepad_update(platf_input, gamepad.id, state);
-
             gamepad.back_timeout_id = nullptr;
+            gamepad.home_release_id = task_pool.pushDelayed([input, controller, id, generation]() {
+              std::lock_guard<std::recursive_mutex> lock(input->dispatch_lock);
+              if (!input->input_queue.valid(generation)) return;
+              auto &gamepad = input->gamepads[controller];
+              if (gamepad.id != id || !gamepad.home_release_id) return;
+              platf::android_input::scope scope(input->client_context.get());
+              gamepad.gamepad_state.buttonFlags &= ~platf::HOME;
+              platf::gamepad_update(platf_input, id, gamepad.gamepad_state);
+              gamepad.home_release_id = nullptr;
+            }, 100ms).task_id;
           };
 
           gamepad.back_timeout_id = task_pool.pushDelayed(std::move(f), config::input.back_button_timeout).task_id;
@@ -1499,49 +1477,16 @@ namespace input {
    * @param input The input context pointer.
    */
   void passthrough_next_message(std::shared_ptr<input_t> input) {
+    std::lock_guard<std::recursive_mutex> dispatch(input->dispatch_lock);
+    platf::android_input::scope scope(input->client_context.get());
+    for (unsigned processed = 0; processed < 32; ++processed) {
     // 'entry' backs the 'payload' pointer, so they must remain in scope together
     std::vector<uint8_t> entry;
-    PNV_INPUT_HEADER payload;
+    if (!input->input_queue.take(entry, [](auto &dest, auto &src) {
+      return static_cast<int>(batch(reinterpret_cast<PNV_INPUT_HEADER>(dest.data()), reinterpret_cast<PNV_INPUT_HEADER>(src.data())));
+    })) break;
+    auto payload = reinterpret_cast<PNV_INPUT_HEADER>(entry.data());
 
-    // Lock the input queue while batching, but release it before sending
-    // the input to the OS. This avoids potentially lengthy lock contention
-    // in the control stream thread while input is being processed by the OS.
-    {
-      std::lock_guard<std::mutex> lg(input->input_queue_lock);
-
-      // If all entries have already been processed, nothing to do
-      if (input->input_queue.empty()) {
-        return;
-      }
-
-      // Pop off the first entry, which we will send
-      entry = input->input_queue.front();
-      payload = (PNV_INPUT_HEADER) entry.data();
-      input->input_queue.pop_front();
-
-      // Try to batch with remaining items on the queue
-      auto i = input->input_queue.begin();
-      while (i != input->input_queue.end()) {
-        auto batchable_entry = *i;
-        auto batchable_payload = (PNV_INPUT_HEADER) batchable_entry.data();
-
-        auto batch_result = batch(payload, batchable_payload);
-        if (batch_result == batch_result_e::terminate_batch) {
-          // Stop batching
-          break;
-        } else if (batch_result == batch_result_e::batched) {
-          // Erase this entry since it was batched
-          i = input->input_queue.erase(i);
-        } else {
-          // We couldn't batch this entry, but try to batch later entries.
-          i++;
-        }
-      }
-    }
-
-    // TODO(Lori)
-    // Print the final input packet
-    input::print((void *) payload);
 
     // Send the batched input to the OS
     switch (util::endian::little(payload->magic)) {
@@ -1590,6 +1535,9 @@ namespace input {
         passthrough(input, (PSS_CONTROLLER_BATTERY_PACKET) payload);
         break;
     }
+    }
+    // Retain dispatcher ownership while yielding to other sessions.
+    if (input->input_queue.finishSlice()) task_pool.push(passthrough_next_message, input);
   }
 
   /**
@@ -1598,57 +1546,83 @@ namespace input {
    * @param input_data The input message.
    */
   void passthrough(std::shared_ptr<input_t> &input, std::vector<std::uint8_t> &&input_data) {
-    {
-      std::lock_guard<std::mutex> lg(input->input_queue_lock);
-      input->input_queue.push_back(std::move(input_data));
+    if (input_data.size() < sizeof(NV_INPUT_HEADER)) return;
+    auto header = reinterpret_cast<PNV_INPUT_HEADER>(input_data.data());
+    size_t required = 0;
+    switch (util::endian::little(header->magic)) {
+      case MOUSE_MOVE_REL_MAGIC_GEN5: required = sizeof(NV_REL_MOUSE_MOVE_PACKET); break;
+      case MOUSE_MOVE_ABS_MAGIC: required = sizeof(NV_ABS_MOUSE_MOVE_PACKET); break;
+      case MOUSE_BUTTON_DOWN_EVENT_MAGIC_GEN5:
+      case MOUSE_BUTTON_UP_EVENT_MAGIC_GEN5: required = sizeof(NV_MOUSE_BUTTON_PACKET); break;
+      case SCROLL_MAGIC_GEN5: required = sizeof(NV_SCROLL_PACKET); break;
+      case SS_HSCROLL_MAGIC: required = sizeof(SS_HSCROLL_PACKET); break;
+      case KEY_DOWN_EVENT_MAGIC:
+      case KEY_UP_EVENT_MAGIC: required = sizeof(NV_KEYBOARD_PACKET); break;
+      case MULTI_CONTROLLER_MAGIC_GEN5: required = sizeof(NV_MULTI_CONTROLLER_PACKET); break;
+      case SS_TOUCH_MAGIC: required = sizeof(SS_TOUCH_PACKET); break;
+      case SS_PEN_MAGIC: required = sizeof(SS_PEN_PACKET); break;
+      case SS_CONTROLLER_ARRIVAL_MAGIC: required = sizeof(SS_CONTROLLER_ARRIVAL_PACKET); break;
+      case SS_CONTROLLER_TOUCH_MAGIC: required = sizeof(SS_CONTROLLER_TOUCH_PACKET); break;
+      case SS_CONTROLLER_MOTION_MAGIC: required = sizeof(SS_CONTROLLER_MOTION_PACKET); break;
+      case SS_CONTROLLER_BATTERY_MAGIC: required = sizeof(SS_CONTROLLER_BATTERY_PACKET); break;
+      case UTF8_TEXT_EVENT_MAGIC:
+        if (util::endian::big(header->size) < sizeof(header->magic) ||
+            util::endian::big(header->size) > input_data.size() - sizeof(header->size)) return;
+        required = sizeof(NV_INPUT_HEADER); break;
+      default: return;
     }
-    task_pool.push(passthrough_next_message, input);
+    if (input_data.size() < required) return;
+    if (input->input_queue.enqueue(std::move(input_data))) {
+      task_pool.push(passthrough_next_message, input);
+    }
   }
 
   void reset(std::shared_ptr<input_t> &input) {
-    task_pool.cancel(key_press_repeat_id);
+    std::lock_guard<std::recursive_mutex> dispatch(input->dispatch_lock);
+    input->input_queue.reset();
+    task_pool.cancel(input->key_press_repeat_id);
+    input->key_press_repeat_id = nullptr;
     task_pool.cancel(input->mouse_left_button_timeout);
+    input->mouse_left_button_timeout = nullptr;
+    platf::android_input::scope scope(input->client_context.get());
+    for (auto &gamepad : input->gamepads) {
+      task_pool.cancel(gamepad.back_timeout_id);
+      task_pool.cancel(gamepad.home_release_id);
+      gamepad.home_release_id = nullptr;
+      gamepad.back_timeout_id = nullptr;
+      if (gamepad.id >= 0) free_gamepad(platf_input, gamepad.id);
+      gamepad.id = -1;
+      gamepad.gamepad_state = {};
+      gamepad.back_button_state = button_state_e::NONE;
+    }
+    platf::android_input::reset(input->client_context.get());
+    input->key_press.clear();
+    input->mouse_press.fill(0);
+    input->shortcutFlags = 0;
+    input->accumulated_vscroll_delta = input->accumulated_hscroll_delta = 0;
+  }
 
-    // Ensure input is synchronous, by using the task_pool
-    task_pool.push([]() {
-      for (int x = 0; x < mouse_press.size(); ++x) {
-        if (mouse_press[x]) {
-          platf::button_mouse(platf_input, x, true);
-          mouse_press[x] = false;
-        }
-      }
-
-      for (auto &kp : key_press) {
-        if (!kp.second) {
-          // already released
-          continue;
-        }
-        platf::keyboard_update(platf_input, vk_from_kpid(kp.first) & 0x00FF, true, flags_from_kpid(kp.first));
-        key_press[kp.first] = false;
-      }
-    });
+  void configure(std::shared_ptr<input_t> &input, int displayId, int width, int height, int rotation) {
+    std::lock_guard<std::recursive_mutex> dispatch(input->dispatch_lock);
+    reset(input);
+    platf::android_input::configure(input->client_context.get(), displayId, width, height, rotation);
   }
 
   class deinit_t: public platf::deinit_t {
   public:
     ~deinit_t() override {
-#ifndef __ANDROID__
       platf_input.reset();
-#endif
     }
   };
 
   [[nodiscard]] std::unique_ptr<platf::deinit_t> init() {
-#ifndef __ANDROID__
     platf_input = platf::input();
-#endif
 
     return std::make_unique<deinit_t>();
   }
 
   bool probe_gamepads() {
-    auto input = static_cast<platf::input_t *>(platf_input.get());
-    const auto gamepads = platf::supported_gamepads(input);
+    const auto gamepads = platf::supported_gamepads(std::addressof(platf_input));
     for (auto &gamepad : gamepads) {
       if (gamepad.is_enabled && gamepad.name != "auto") {
         return false;
@@ -1663,12 +1637,6 @@ namespace input {
       mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback)
     );
 
-    // Workaround to ensure new frames will be captured when a client connects
-    task_pool.pushDelayed([]() {
-      platf::move_mouse(platf_input, 1, 1);
-      platf::move_mouse(platf_input, -1, -1);
-    },
-                          100ms);
 
     return input;
   }

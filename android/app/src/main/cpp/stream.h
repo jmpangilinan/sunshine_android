@@ -39,7 +39,9 @@ namespace stream {
     std::optional<int> gcmap;
   };
 
-  void postFrame(std::vector<uint8_t> &&frame_data, int64_t frame_index, bool idr, void* channel_data);
+  void postFrame(std::vector<uint8_t> &&frame_data, int64_t frame_index, bool idr, void *channel_data,
+                 const safe::mail_raw_t::queue_t<video::packet_t> &packets,
+                 std::optional<std::chrono::steady_clock::time_point> frame_timestamp);
 
   namespace session {
     enum class state_e : int {

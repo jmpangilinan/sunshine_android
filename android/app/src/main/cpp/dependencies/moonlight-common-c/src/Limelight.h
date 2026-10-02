@@ -688,6 +688,8 @@ int LiSendMouseButtonEvent(char action, int button);
 #define MODIFIER_CTRL 0x02
 #define MODIFIER_ALT 0x04
 #define MODIFIER_META 0x08
+// Identifies an extended (0xE0) key, including keypad Enter.
+#define MODIFIER_EXTENDED 0x10
 int LiSendKeyboardEvent(short keyCode, char keyAction, char modifiers);
 
 // Similar to LiSendKeyboardEvent() but allows the client to inform the host that

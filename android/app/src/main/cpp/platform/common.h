@@ -672,7 +672,8 @@ namespace platf {
     }
   };
 
-  bool send_batch(batched_send_info_t &send_info);
+  // False is a send failure (possibly partial), never unsupported batching.
+  bool send_batch(batched_send_info_t &send_info, const std::function<bool()> &cancelled = {});
 
   struct send_info_t {
     const char *header;
@@ -738,7 +739,7 @@ namespace platf {
   void button_mouse(input_t &input, int button, bool release);
   void scroll(input_t &input, int distance);
   void hscroll(input_t &input, int distance);
-  void keyboard_update(input_t &input, uint16_t modcode, bool release, uint8_t flags);
+  void keyboard_update(input_t &input, uint16_t modcode, bool release, uint8_t flags, bool extended = false);
   void gamepad_update(input_t &input, int nr, const gamepad_state_t &gamepad_state);
   void unicode(input_t &input, char *utf8, int size);
 

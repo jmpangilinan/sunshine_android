@@ -10,6 +10,9 @@
 #include "utility.h"
 
 #include <bitset>
+#ifdef __ANDROID__
+#include <jni.h>
+#endif
 
 namespace audio {
   enum stream_config_e : int {
@@ -72,6 +75,13 @@ namespace audio {
   using audio_ctx_ref_t = safe::shared_t<audio_ctx_t>::ptr_t;
 
   void capture(safe::mail_t mail, config_t config, void *channel_data);
+
+#ifdef __ANDROID__
+  // Owns this session's bounded PCM queue, reader and encoder until shutdown.
+  // Playback capture is stopped before joining the reader and released afterward.
+  void capture_android(void *channel_data, safe::mail_t mail, const config_t &config,
+                       JavaVM *vm, jclass bridge, int session_id);
+#endif
 
   /**
    * @brief Get the reference to the audio context.

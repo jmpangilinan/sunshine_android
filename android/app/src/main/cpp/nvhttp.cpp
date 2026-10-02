@@ -1241,25 +1241,25 @@ void start() {
   http_server.config.address = net::af_to_any_address_string(address_family);
   http_server.config.port = port_http;
 
-  auto accept_and_run = [&](auto *http_server) {
+  auto accept_and_run = [&](auto *http_server, unsigned listener) {
     try {
-      http_server->start();
-    } catch (boost::system::system_error &err) {
+      http_server->start([&, http_server, listener](unsigned short) {
+        if (shutdown_event->peek()) http_server->stop();
+        else sunshine_callbacks::hostListenerReady(listener);
+      });
+    } catch (const std::exception &err) {
       // It's possible the exception gets thrown after calling
       // http_server->stop() from a different thread
       if (shutdown_event->peek()) {
         return;
       }
 
-      BOOST_LOG(fatal) << "Couldn't start http server on ports ["sv
-                       << port_https << ", "sv << port_https << "]: "sv
-                       << err.what();
-      shutdown_event->raise(true);
+      sunshine_callbacks::hostStartupFailed(std::string("HTTP listener: ") + err.what());
       return;
     }
   };
-  std::thread ssl{accept_and_run, &https_server};
-  std::thread tcp{accept_and_run, &http_server};
+  std::thread ssl{accept_and_run, &https_server, 4u};
+  std::thread tcp{accept_and_run, &http_server, 2u};
 
   // Wait for any event
   shutdown_event->view();

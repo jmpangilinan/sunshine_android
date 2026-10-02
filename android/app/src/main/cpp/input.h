@@ -16,6 +16,8 @@ namespace input {
 
   void print(void *input);
   void reset(std::shared_ptr<input_t> &input);
+  // Physical mirrored display, never the encoder VirtualDisplay.
+  void configure(std::shared_ptr<input_t> &input, int displayId, int width, int height, int rotation);
   void passthrough(std::shared_ptr<input_t> &input, std::vector<std::uint8_t> &&input_data);
 
   [[nodiscard]] std::unique_ptr<platf::deinit_t> init();

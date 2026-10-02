@@ -17,97 +17,12 @@ namespace platf {
     return "屏易连";
   }
 
-  std::vector<supported_gamepad_t> &supported_gamepads(input_t *input) {
-    static std::vector gamepads {
-      supported_gamepad_t {"", false, "gamepads.macos_not_implemented"}
-    };
-
-    return gamepads;
-  }
-
-  /**
-   * @brief
-   */
-  void move_mouse(input_t &input, int deltaX, int deltaY) {
-    BOOST_LOG(info) << "Android move_mouse not support"sv;
-  }
-
-  void abs_mouse(input_t &input, const touch_port_t &touch_port, float x, float y) {
-    BOOST_LOG(info) << "Android abs_mouse not support"sv;
-  }
-
-  void button_mouse(input_t &input, int button, bool release) {
-    BOOST_LOG(info) << "Android button_mouse not support"sv;
-  }
-
-  void keyboard_update(input_t &input, uint16_t modcode, bool release, uint8_t flags) {
-    BOOST_LOG(info) << "Android keyboard_update not support"sv;
-  }
-
-  void scroll(input_t &input, int distance) {
-    BOOST_LOG(info) << "Android scroll not support"sv;
-  }
-
-  void hscroll(input_t &input, int distance) {
-    BOOST_LOG(info) << "Android hscroll not support"sv;
-  }
-
-  void unicode(input_t &input, char *utf8, int size) {
-    BOOST_LOG(info) << "Android unicode not support"sv;
-  }
-
-  void gamepad_update(input_t &input, int nr, const gamepad_state_t &gamepad_state){
-    BOOST_LOG(info) << "Android gamepad_update not support"sv;
-  }
-
-  void pen_update(client_input_t *input, const touch_port_t &touch_port, const pen_input_t &pen){
-    BOOST_LOG(info) << "Android pen_update not support"sv;
-  }
-
-  int alloc_gamepad(input_t &input, const gamepad_id_t &id, const gamepad_arrival_t &metadata, feedback_queue_t feedback_queue){
-    BOOST_LOG(info) << "Android alloc_gamepad not support"sv;
-    return -1;
-  }
-
-  void gamepad_touch(input_t &input, const gamepad_touch_t &touch){
-    BOOST_LOG(info) << "Android gamepad_touch not support"sv;
-  }
-
-  void gamepad_motion(input_t &input, const gamepad_motion_t &motion){
-    BOOST_LOG(info) << "Android gamepad_motion not support"sv;
-  }
-
-  void gamepad_battery(input_t &input, const gamepad_battery_t &battery){
-    BOOST_LOG(info) << "Android gamepad_battery not support"sv;
-  }
 
   std::string get_mac_address(const std::string_view &address) {
     // TODO
     return {};
   }
 
-  struct client_input_raw_t: public client_input_t {
-  };
-
-  std::unique_ptr<client_input_t> allocate_client_input_context(input_t &input) {
-    return std::make_unique<client_input_raw_t>();
-  }
-
-  void freeInput(void *p) {
-  }
-
-  platform_caps::caps_t get_capabilities() {
-    platform_caps::caps_t caps = 0;
-    // TODO: if has_uinput
-    caps |= platform_caps::pen_touch;
-
-    // We support controller touchpad input only when emulating the PS5 controller
-    if (config::input.gamepad == "ds5"sv || config::input.gamepad == "auto"sv) {
-      caps |= platform_caps::controller_touch;
-    }
-
-    return caps;
-  }
 
   std::string from_sockaddr(const sockaddr *const ip_addr) {
     char data[INET6_ADDRSTRLEN] = {};
@@ -178,7 +93,20 @@ namespace platf {
     return saddr_v6;
   }
 
-  bool send_batch(batched_send_info_t &send_info) {
+  bool send_batch(batched_send_info_t &send_info, const std::function<bool()> &cancelled) {
+    const auto deadline = std::chrono::steady_clock::now() + 250ms;
+    auto aborted = [&] {
+      return (cancelled && cancelled()) || std::chrono::steady_clock::now() >= deadline;
+    };
+    auto wait_writable = [&] {
+      while (!aborted()) {
+        struct pollfd pfd = {(int) send_info.native_socket, POLLOUT, 0};
+        auto result = poll(&pfd, 1, 25);
+        if (result > 0) return (pfd.revents & POLLOUT) && !(pfd.revents & (POLLERR | POLLHUP | POLLNVAL));
+        if (result < 0 && errno != EINTR) return false;
+      }
+      return false;
+    };
     auto sockfd = (int) send_info.native_socket;
     struct msghdr msg = {};
 
@@ -248,6 +176,7 @@ namespace platf {
       struct iovec iovs[(send_info.headers ? std::min(seg_max, send_info.block_count) : 1) * max_iovs_per_msg] = {};
       auto msg_size = send_info.header_size + send_info.payload_size;
       while (seg_index < send_info.block_count) {
+        if (aborted()) return false;
         int iovlen = 0;
         auto segs_in_batch = std::min(send_info.block_count - seg_index, seg_max);
         if (send_info.headers) {
@@ -291,32 +220,23 @@ namespace platf {
           msg.msg_controllen = cmbuflen;
         }
 
-        // This will fail if GSO is not available, so we will fall back to non-GSO if
-        // it's the first sendmsg() call. On subsequent calls, we will treat errors as
-        // actual failures and return to the caller.
-        auto bytes_sent = sendmsg(sockfd, &msg, 0);
+        // Fall back only for unsupported GSO with no transmitted segments.
+        // Cancellation, congestion timeout and partial-send errors are failures.
+        auto bytes_sent = sendmsg(sockfd, &msg, MSG_DONTWAIT);
         if (bytes_sent < 0) {
-          // If there's no send buffer space, wait for some to be available
-          if (errno == EAGAIN) {
-            struct pollfd pfd;
-
-            pfd.fd = sockfd;
-            pfd.events = POLLOUT;
-
-            if (poll(&pfd, 1, -1) != 1) {
-              BOOST_LOG(warning) << "poll() failed: "sv << errno;
-              break;
-            }
-
-            // Try to send again
+          if (errno == EINTR) continue;
+          if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (!wait_writable()) return false;
             continue;
           }
-
-          BOOST_LOG(verbose) << "sendmsg() failed: "sv << errno;
-          break;
+          // Only unsupported GSO before any progress permits another send path.
+          if (seg_index == 0 && (errno == EINVAL || errno == ENOPROTOOPT ||
+                                errno == EOPNOTSUPP || errno == ENOSYS)) break;
+          BOOST_LOG(warning) << "sendmsg() failed: "sv << errno;
+          return false;
         }
-
-        seg_index += bytes_sent / msg_size;
+        if (bytes_sent != segs_in_batch * msg_size) return false;
+        seg_index += segs_in_batch;
       }
 
       // If we sent something, return the status and don't fall back to the non-GSO path.
@@ -359,27 +279,18 @@ namespace platf {
       // Call sendmmsg() until all messages are sent
       size_t blocks_sent = 0;
       while (blocks_sent < send_info.block_count) {
-        int msgs_sent = sendmmsg(sockfd, &msgs[blocks_sent], send_info.block_count - blocks_sent, 0);
+        if (aborted()) return false;
+        int msgs_sent = sendmmsg(sockfd, &msgs[blocks_sent], send_info.block_count - blocks_sent, MSG_DONTWAIT);
         if (msgs_sent < 0) {
-          // If there's no send buffer space, wait for some to be available
-          if (errno == EAGAIN) {
-            struct pollfd pfd;
-
-            pfd.fd = sockfd;
-            pfd.events = POLLOUT;
-
-            if (poll(&pfd, 1, -1) != 1) {
-              BOOST_LOG(warning) << "poll() failed: "sv << errno;
-              break;
-            }
-
-            // Try to send again
+          if (errno == EINTR) continue;
+          if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (!wait_writable()) return false;
             continue;
           }
-
           BOOST_LOG(warning) << "sendmmsg() failed: "sv << errno;
           return false;
         }
+        if (msgs_sent == 0) return false;
 
         blocks_sent += msgs_sent;
       }

@@ -24,13 +24,20 @@
 cmake_minimum_required(VERSION 3.12...3.27)
 project(openssl-cmake)
 
-set(BUILD_OPENSSL OFF CACHE BOOL "Automated OpenSSL building")
-set(OPENSSL_BUILD_VERSION OFF CACHE STRING "OpenSSL version to build")
+# Android prebuilts are incomplete (notably x86) and have no published hashes.
+# Build the same verified source release for every Android ABI instead.
+set(BUILD_OPENSSL ${ANDROID} CACHE BOOL "Automated OpenSSL building")
+set(OPENSSL_BUILD_VERSION "3.3.2" CACHE STRING "OpenSSL version to build")
+set(OPENSSL_BUILD_URL "https://www.openssl.org/source/openssl-${OPENSSL_BUILD_VERSION}.tar.gz" CACHE STRING "OpenSSL source archive URL")
+if(OPENSSL_BUILD_VERSION STREQUAL "3.3.2")
+    set(OPENSSL_BUILD_HASH "2e8a40b01979afe8be0bbfb3de5dc1c6709fedb46d6c89c10da114ab5fc3d281" CACHE STRING "OpenSSL source archive SHA256")
+endif()
 set(OPENSSL_USE_STATIC_LIBS OFF CACHE STRING "OpenSSL static libs are preferred over shared libs")
 set(OPENSSL_INSTALL_MAN OFF CACHE STRING "Install man pages?")
-set(OPENSSL_MODULES "no-cast no-md2 no-md4 no-mdc2 no-rc4 no-rc5 no-engine no-idea no-mdc2 no-rc5 no-camellia no-ssl3 no-heartbeats no-gost no-deprecated no-capieng no-comp no-dtls no-psk no-srp no-dso no-dsa no-rc2 no-des" CACHE STRING "OpenSSL configure options")
+# Keep deprecated crypto declarations used by Sunshine (including RSA APIs).
+set(OPENSSL_MODULES "" CACHE STRING "OpenSSL configure options")
 set(OPENSSL_RPATH "" CACHE STRING "RPath to set during build")
-set(CROSS_ANDROID OFF CACHE BOOL "Cross-compiling for Android?")
+set(CROSS_ANDROID ${ANDROID} CACHE BOOL "Cross-compiling for Android?")
 set(CROSS OFF CACHE BOOL "Cross-compiling?")
 set(CROSS_TARGET OFF CACHE STRING "Cross-compilation target")
 set(SYSTEM_OPENSSL OFF CACHE STRING "Use system-provided openssl libraries (instead of prebuilts or building)")

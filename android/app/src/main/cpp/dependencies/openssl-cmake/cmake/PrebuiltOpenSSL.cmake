@@ -53,9 +53,21 @@ if (NOT OPENSSL_PREBUILT_VERSION)
     set(OPENSSL_PREBUILT_VERSION "3.3.2")
 endif()
 
+# Prebuilt use is explicit; never download an unauthenticated archive.
+if (NOT OPENSSL_PREBUILT_HASH MATCHES "^[0-9a-fA-F]+$")
+    message(FATAL_ERROR "OPENSSL_PREBUILT_HASH is required; prefer BUILD_OPENSSL=ON for verified sources")
+endif()
+string(LENGTH "${OPENSSL_PREBUILT_HASH}" OPENSSL_PREBUILT_HASH_LENGTH)
+if (NOT OPENSSL_PREBUILT_HASH_LENGTH EQUAL 64)
+    message(FATAL_ERROR "OPENSSL_PREBUILT_HASH must contain exactly 64 hexadecimal digits")
+endif()
+
 # add openssl target
 ExternalProject_Add(openssl
         URL https://builds.viaduck.org/prebuilts/openssl/${OPENSSL_PREBUILT_VERSION}/${PREBUILT_BRANCH}.tar.gz
+        URL_HASH SHA256=${OPENSSL_PREBUILT_HASH}
+        TLS_VERIFY TRUE
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
 
         UPDATE_COMMAND ""
         CONFIGURE_COMMAND ""

@@ -29,6 +29,7 @@ include(ExternalProject)
 
 # find packages
 find_package(Python COMPONENTS Interpreter REQUIRED)
+find_package(Perl REQUIRED)
 
 # used to apply various patches to OpenSSL
 find_program(PATCH_PROGRAM patch)
@@ -40,15 +41,20 @@ endif()
 # set variables
 ProcessorCount(NUM_JOBS)
 set(OS "UNIX")
-
-if (OPENSSL_BUILD_HASH)
-    set(OPENSSL_CHECK_HASH URL_HASH SHA256=${OPENSSL_BUILD_HASH})
+if (NOT OPENSSL_BUILD_URL MATCHES "^https://")
+    message(FATAL_ERROR "OPENSSL_BUILD_URL must use HTTPS")
 endif()
 
-# if already built, do not build again
-if (EXISTS ${OPENSSL_PREFIX})
-    message(WARNING "Not building OpenSSL again. Remove ${OPENSSL_PREFIX} for rebuild")
-else()
+if (NOT OPENSSL_BUILD_HASH MATCHES "^[0-9a-fA-F]+$")
+    message(FATAL_ERROR "OPENSSL_BUILD_HASH must be a verified SHA256 source checksum")
+endif()
+string(LENGTH "${OPENSSL_BUILD_HASH}" OPENSSL_HASH_LENGTH)
+if (NOT OPENSSL_HASH_LENGTH EQUAL 64)
+    message(FATAL_ERROR "OPENSSL_BUILD_HASH must contain exactly 64 hexadecimal digits")
+endif()
+set(OPENSSL_CHECK_HASH URL_HASH SHA256=${OPENSSL_BUILD_HASH})
+
+# ExternalProject stamps, not the existence of a partial install, own rebuilds.
     if (NOT OPENSSL_BUILD_VERSION)
         message(FATAL_ERROR "You must specify OPENSSL_BUILD_VERSION!")
     endif()
@@ -77,7 +83,7 @@ else()
         message(FATAL_ERROR "Unsupported platform")
     else()
         # for OpenSSL we can only use GNU make, no exotic things like Ninja (MSYS always uses GNU make)
-        find_program(MAKE_PROGRAM make)
+        find_program(MAKE_PROGRAM NAMES gmake make REQUIRED)
     endif()
 
     # on windows we need to replace path to perl since CreateProcess(..) cannot handle unix paths
@@ -102,20 +108,15 @@ else()
         --bash "${MSYS_BASH}" --make "${MINGW_MAKE}" --envfile "${CMAKE_CURRENT_BINARY_DIR}/buildenv.txt" ${OS})
 
     # user-specified modules
-    set(CONFIGURE_OPENSSL_MODULES ${OPENSSL_MODULES})
+    separate_arguments(CONFIGURE_OPENSSL_MODULES UNIX_COMMAND "${OPENSSL_MODULES}")
 
     # additional configure script parameters
     set(CONFIGURE_OPENSSL_PARAMS --libdir=lib)
     if (OPENSSL_DEBUG_BUILD)
-        set(CONFIGURE_OPENSSL_PARAMS "${CONFIGURE_OPENSSL_PARAMS} no-asm -g3 -O0 -fno-omit-frame-pointer -fno-inline-functions")
+        list(APPEND CONFIGURE_OPENSSL_PARAMS no-asm -g3 -O0 -fno-omit-frame-pointer -fno-inline-functions)
     endif()
     if (OPENSSL_RPATH)
-        # ridiculous escaping required to pass through cmake, one shell, one makefile and another shell.
-        # \\\\ in shell, \\ in makefile
-        string(REPLACE "\\" "\\\\\\\\" OPENSSL_RPATH_ESCAPED ${OPENSSL_RPATH})
-        # \\$\$ in shell, \$$ in makefile
-        string(REPLACE "\$" "\\\\\$\\\$" OPENSSL_RPATH_ESCAPED ${OPENSSL_RPATH_ESCAPED}) # \$$ in makefile
-        set(CONFIGURE_OPENSSL_PARAMS "${CONFIGURE_OPENSSL_PARAMS} -Wl,-rpath=${OPENSSL_RPATH_ESCAPED}")
+        list(APPEND CONFIGURE_OPENSSL_PARAMS "-Wl,-rpath=${OPENSSL_RPATH}")
     endif()
     
     # set install command depending of choice on man page generation
@@ -141,27 +142,49 @@ else()
         endif()
         
         # arch options
-        if (ARMEABI_V7A)
+        if (CMAKE_ANDROID_ARCH_ABI STREQUAL "armeabi-v7a")
             set(OPENSSL_PLATFORM "arm")
-            set(CONFIGURE_OPENSSL_PARAMS ${CONFIGURE_OPENSSL_PARAMS} "-march=armv7-a")
+        elseif (CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
+            set(OPENSSL_PLATFORM "arm64")
+        elseif (CMAKE_ANDROID_ARCH_ABI STREQUAL "x86")
+            set(OPENSSL_PLATFORM "x86")
+        elseif (CMAKE_ANDROID_ARCH_ABI STREQUAL "x86_64")
+            set(OPENSSL_PLATFORM "x86_64")
         else()
-            if (CMAKE_ANDROID_ARCH_ABI MATCHES "arm64-v8a")
-                set(OPENSSL_PLATFORM "arm64")
-            else()
-                set(OPENSSL_PLATFORM ${CMAKE_ANDROID_ARCH_ABI})
-            endif()
+            message(FATAL_ERROR "Unsupported Android OpenSSL ABI: ${CMAKE_ANDROID_ARCH_ABI}")
         endif()
         
         # collect options to pass via ENV to openssl configure
-        set(FORWARD_ANDROID_NDK "${ANDROID_NDK}")
-        # silence warnings about unused arguments (Clang specific)
-        set(FORWARD_CFLAGS "${CMAKE_C_FLAGS} -Qunused-arguments")
-        set(FORWARD_CXXFLAGS "${CMAKE_CXX_FLAGS} -Qunused-arguments")
-        set(FORWARD_LDFLAGS "${CMAKE_MODULE_LINKER_FLAGS}")
-        set(FORWARD_PATH "${ANDROID_TOOLCHAIN_ROOT}/bin/:${ANDROID_TOOLCHAIN_ROOT}/${ANDROID_TOOLCHAIN_NAME}/bin/")
-        
-        # Android specific configuration options
-        set(CONFIGURE_OPENSSL_MODULES ${CONFIGURE_OPENSSL_MODULES} no-hw)
+        # OpenSSL 3.3.2 locates clang/llvm-ar on PATH inside the NDK and
+        # chooses its API-suffixed clang wrapper from __ANDROID_API__.
+        # NDK r28 has no legacy GCC toolchain directories.
+        set(FORWARD_ANDROID_NDK_ROOT "${CMAKE_ANDROID_NDK}")
+        if (NOT FORWARD_ANDROID_NDK_ROOT)
+            set(FORWARD_ANDROID_NDK_ROOT "${ANDROID_NDK}")
+        endif()
+        get_filename_component(OPENSSL_TOOLCHAIN_BIN "${CMAKE_C_COMPILER}" DIRECTORY)
+        set(FORWARD_PATH "${OPENSSL_TOOLCHAIN_BIN}")
+        set(FORWARD_CC clang)
+        set(FORWARD_AR llvm-ar)
+        set(FORWARD_RANLIB llvm-ranlib)
+        set(FORWARD_CFLAGS "${CMAKE_C_FLAGS} -fPIC -Qunused-arguments")
+        set(FORWARD_CXXFLAGS "${CMAKE_CXX_FLAGS} -fPIC -Qunused-arguments")
+        set(FORWARD_LDFLAGS "${CMAKE_SHARED_LINKER_FLAGS}")
+        # Dependencies may shadow CMAKE_SYSTEM_VERSION (e.g. with 1).
+        # Prefer the NDK's resolved platform, then its explicit android-N value.
+        if (ANDROID_PLATFORM_LEVEL MATCHES "^[0-9]+$")
+            set(OPENSSL_ANDROID_API "${ANDROID_PLATFORM_LEVEL}")
+        elseif (ANDROID_PLATFORM MATCHES "^android-([0-9]+)$")
+            set(OPENSSL_ANDROID_API "${CMAKE_MATCH_1}")
+        elseif (ANDROID_NATIVE_API_LEVEL MATCHES "^[0-9]+$")
+            set(OPENSSL_ANDROID_API "${ANDROID_NATIVE_API_LEVEL}")
+        else()
+            set(OPENSSL_ANDROID_API "${CMAKE_SYSTEM_VERSION}")
+        endif()
+        if (NOT OPENSSL_ANDROID_API MATCHES "^[0-9]+$" OR OPENSSL_ANDROID_API LESS 21)
+            message(FATAL_ERROR "Android OpenSSL requires a valid NDK platform API level (21+)")
+        endif()
+        list(APPEND CONFIGURE_OPENSSL_PARAMS "-D__ANDROID_API__=${OPENSSL_ANDROID_API}")
         
         set(COMMAND_CONFIGURE ./Configure android-${OPENSSL_PLATFORM} ${CONFIGURE_OPENSSL_PARAMS} ${CONFIGURE_OPENSSL_MODULES})
         set(COMMAND_TEST "true")
@@ -174,15 +197,29 @@ else()
     endif()
 
     # build OPENSSL_PATCH_COMMAND
-    include(PatchOpenSSL)
+    # These vendor patches only modify tests, which Android does not run.
+    if (OPENSSL_ENABLE_TESTS AND NOT CROSS_ANDROID)
+        include(PatchOpenSSL)
+    endif()
+    set(OPENSSL_CONFIGURE_PREFIX)
+    if (CROSS_ANDROID AND CMAKE_ANDROID_ARCH_ABI STREQUAL "armeabi-v7a")
+        if (NOT OPENSSL_BUILD_VERSION STREQUAL "3.3.2")
+            message(FATAL_ERROR "Review ARM capability visibility patch for this OpenSSL version")
+        endif()
+        set(OPENSSL_CONFIGURE_PREFIX ${CMAKE_COMMAND}
+            -DOPENSSL_SOURCE_DIR=<SOURCE_DIR>
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PatchAndroidArmcap.cmake" COMMAND)
+    endif()
 
     # add openssl target
     ExternalProject_Add(openssl
-        URL https://mirror.viaduck.org/openssl/openssl-${OPENSSL_BUILD_VERSION}.tar.gz
+        URL "${OPENSSL_BUILD_URL}"
         ${OPENSSL_CHECK_HASH}
+        TLS_VERIFY TRUE
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
         UPDATE_COMMAND ""
 
-        CONFIGURE_COMMAND ${BUILD_ENV_TOOL} <SOURCE_DIR> -- ${COMMAND_CONFIGURE}
+        CONFIGURE_COMMAND ${OPENSSL_CONFIGURE_PREFIX} ${BUILD_ENV_TOOL} <SOURCE_DIR> -- ${COMMAND_CONFIGURE}
         ${OPENSSL_PATCH_COMMAND}
 
         BUILD_COMMAND ${BUILD_ENV_TOOL} <SOURCE_DIR> -- ${MAKE_PROGRAM} -j ${NUM_JOBS}
@@ -193,7 +230,7 @@ else()
 
         INSTALL_COMMAND ${BUILD_ENV_TOOL} <SOURCE_DIR> -- ${PERL_PATH_FIX_INSTALL}
         COMMAND ${BUILD_ENV_TOOL} <SOURCE_DIR> -- ${MAKE_PROGRAM} DESTDIR=${OPENSSL_PREFIX} install_sw ${INSTALL_OPENSSL_MAN}
-        COMMAND ${CMAKE_COMMAND} -G ${CMAKE_GENERATOR} ${CMAKE_BINARY_DIR}                    # force CMake-reload
+        # Ninja already knows the installed artifacts through BUILD_BYPRODUCTS.
 
         LOG_INSTALL 1
     )
@@ -207,5 +244,17 @@ else()
             set(OUT_FILE "${OUT_FILE}${_envName}=\"${_envValue}\"\n")
         endif()
     endforeach()
-    file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/buildenv.txt ${OUT_FILE})
-endif()
+    set(OPENSSL_ENV_FILE "${CMAKE_CURRENT_BINARY_DIR}/buildenv.txt")
+    if (EXISTS "${OPENSSL_ENV_FILE}")
+        file(READ "${OPENSSL_ENV_FILE}" OPENSSL_OLD_ENV)
+    endif()
+    if (NOT EXISTS "${OPENSSL_ENV_FILE}" OR NOT OPENSSL_OLD_ENV STREQUAL OUT_FILE)
+        file(WRITE "${OPENSSL_ENV_FILE}" "${OUT_FILE}")
+    endif()
+    ExternalProject_Add_StepDependencies(openssl configure
+        "${OPENSSL_ENV_FILE}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/scripts/building_env.py")
+    if (OPENSSL_CONFIGURE_PREFIX)
+        ExternalProject_Add_StepDependencies(openssl configure
+            "${CMAKE_CURRENT_SOURCE_DIR}/cmake/PatchAndroidArmcap.cmake")
+    endif()

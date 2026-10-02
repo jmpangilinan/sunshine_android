@@ -931,7 +931,12 @@ namespace stream {
         << "firstFrame [" << firstFrame << ']' << std::endl
         << "lastFrame [" << lastFrame << ']';
 
+#ifdef __ANDROID__
+      // MediaCodec has no reference-frame invalidation API.
+      session->video.idr_events->raise(true);
+#else
       session->video.invalidate_ref_frames_events->raise(std::make_pair(firstFrame, lastFrame));
+#endif
     });
 
     server->map(packetTypes[IDX_INPUT_DATA], [&](session_t *session, const std::string_view &payload) {
@@ -1266,6 +1271,7 @@ namespace stream {
       frame_network_latency_logger.first_point_now();
 
       auto session = (session_t *) packet->channel_data;
+      if (session->shutdown_event->peek()) continue;
       auto lowseq = session->video.lowseq;
 
       std::string_view payload {(char *) packet->data(), packet->data_size()};
@@ -1498,24 +1504,11 @@ namespace stream {
               batch_info.block_count = current_batch_size;
 
               frame_send_batch_latency_logger.first_point_now();
-              // Use a batched send if it's supported on this platform
-              if (!platf::send_batch(batch_info)) {
-                // Batched send is not available, so send each packet individually
-                BOOST_LOG(verbose) << "Falling back to unbatched send"sv;
-                for (auto y = 0; y < current_batch_size; y++) {
-                  auto send_info = platf::send_info_t {
-                    shards.prefix(next_shard_to_send + y),
-                    shards.prefixsize,
-                    shards.data(next_shard_to_send + y),
-                    shards.blocksize,
-                    (uintptr_t) sock.native_handle(),
-                    peer_address,
-                    session->video.peer.port(),
-                    session->localAddress,
-                  };
-
-                  platf::send(send_info);
-                }
+              // False may follow partial progress: never resend already sent shards.
+              if (!platf::send_batch(batch_info, [&] {
+                    return shutdown_event->peek() || session->shutdown_event->peek();
+                  })) {
+                throw std::runtime_error("Video UDP batch failed or was cancelled");
               }
               frame_send_batch_latency_logger.second_point_now_and_log();
 
@@ -1545,7 +1538,7 @@ namespace stream {
         session->video.lowseq = lowseq;
       } catch (const std::exception &e) {
         BOOST_LOG(error) << "Broadcast video failed "sv << e.what();
-        std::this_thread::sleep_for(100ms);
+        session::stop(*session);
       }
     }
 
@@ -1772,13 +1765,12 @@ namespace stream {
     auto start_time = std::chrono::steady_clock::now();
     auto current_time = start_time;
 
-    while (current_time - start_time < config::stream.ping_timeout) {
-      auto delta_time = current_time - start_time;
-
-      auto msg_opt = messages->pop(config::stream.ping_timeout - delta_time);
-      if (!msg_opt) {
-        break;
-      }
+    while (current_time - start_time < timeout && !session->shutdown_event->peek()
+           && !mail::man->event<bool>(mail::shutdown)->peek()) {
+      auto remaining = timeout - std::chrono::duration_cast<std::chrono::milliseconds>(current_time - start_time);
+      auto msg_opt = messages->pop(std::min(remaining, 50ms));
+      current_time = std::chrono::steady_clock::now();
+      if (!msg_opt) continue;
 
       TUPLE_2D_REF(recv_peer, msg, *msg_opt);
       if (msg.find(expected_payload) != std::string::npos) {
@@ -1802,11 +1794,10 @@ namespace stream {
     return -1;
   }
 
-    safe::mail_raw_t::queue_t<video::packet_t> currentSessionVideoQueue;
   void videoThread(session_t *session) {
-//    auto fg = util::fail_guard([&]() {
-//      session::stop(*session);
-//    });
+    auto fg = util::fail_guard([&]() {
+      session::stop(*session);
+    });
 
     while_starting_do_nothing(session->state);
 
@@ -1820,28 +1811,27 @@ namespace stream {
     auto address = session->video.peer.address();
     session->video.qos = platf::enable_socket_qos(ref->video_sock.native_handle(), address, session->video.peer.port(), platf::qos_data_type_e::video, session->config.videoQosType != 0);
 
-      currentSessionVideoQueue = mail::man->queue<video::packet_t>(mail::video_packets);
-    BOOST_LOG(debug) << "Start capturing Video"sv;
-    sunshine_callbacks::captureVideoLoop(session, session->mail, session->config.monitor, session->config.audio);
-//    video::capture(session->mail, session->config.monitor, session);
+    auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
+    sunshine_callbacks::captureVideoLoop(session, session->mail, session->config.monitor, packets, session->input);
   }
 
-    void postFrame(std::vector<uint8_t> &&frame_data, int64_t frame_index, bool idr, void* channel_data)  {
-        if(currentSessionVideoQueue) {
-            auto packet = std::make_unique<video::packet_raw_generic>(
-                    std::move(frame_data),
-                    frame_index,
-                    idr
-            );
-            packet->channel_data = channel_data;
-            currentSessionVideoQueue->raise(std::move(packet));
+    void postFrame(std::vector<uint8_t> &&frame_data, int64_t frame_index, bool idr, void *channel_data,
+                   const safe::mail_raw_t::queue_t<video::packet_t> &packets,
+                   std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
+        if (!packets || frame_data.empty()) return;
+        auto packet = std::make_unique<video::packet_raw_generic>(std::move(frame_data), frame_index, idr);
+        packet->channel_data = channel_data;
+        packet->frame_timestamp = frame_timestamp;
+        if (!packets->try_raise(std::move(packet))) {
+            BOOST_LOG(error) << "Compressed video queue unavailable/full; stopping session to preserve reference continuity";
+            session::stop(*(session_t *) channel_data);
         }
     }
 
   void audioThread(session_t *session) {
-//    auto fg = util::fail_guard([&]() {
-//      session::stop(*session);
-//    });
+    auto fg = util::fail_guard([&]() {
+      session::stop(*session);
+    });
 
     while_starting_do_nothing(session->state);
 
@@ -1901,7 +1891,7 @@ namespace stream {
       session.controlEnd.view();
       // Reset input on session stop to avoid stuck repeated keys
       BOOST_LOG(debug) << "Resetting Input..."sv;
-//      input::reset(session.input);
+      input::reset(session.input);
 
       // If this is the last session, invoke the platform callbacks
 //      if (--running_sessions == 0) {
@@ -1917,6 +1907,7 @@ namespace stream {
 //      }
 
       BOOST_LOG(debug) << "Session ended"sv;
+      session.state.store(state_e::STOPPED);
     }
 
     int start(session_t &session, const std::string &addr_string) {

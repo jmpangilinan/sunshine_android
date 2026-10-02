@@ -1,0 +1,15 @@
+package com.nightmare.sunshine.input;
+import org.junit.Test;
+import static org.junit.Assert.*;
+public class InputBoundaryTest {
+ @Test public void pointerSlotSurvivesEarlierPointerUp(){PointerTracker p=new PointerTracker();assertEquals(0,p.down(900));assertEquals(1,p.down(12));p.up(900);assertEquals(1,p.slot(12));assertEquals(0,p.down(44));assertEquals(1,p.slot(12));}
+ @Test public void cancelMakesOldMoveInvalid(){PointerTracker p=new PointerTracker();p.down(5);p.cancel();assertFalse(p.contains(5));try{p.slot(5);fail();}catch(IllegalArgumentException expected){}assertEquals(0,p.down(5));}
+ @Test public void rejectsDuplicateDownAndUnknownUp(){PointerTracker p=new PointerTracker();p.down(3);try{p.down(3);fail();}catch(IllegalArgumentException expected){}try{p.up(4);fail();}catch(IllegalArgumentException expected){}assertEquals(0,p.slot(3));}
+ @Test public void keypadEnterKeepsDistinctExtendedIdentity(){assertEquals(66,AndroidInputInjector.mapKey(13,0));assertEquals(160,AndroidInputInjector.mapKey(13,16));assertEquals(96,LinuxKeyMap.fromAndroid(AndroidInputInjector.mapKey(13,16)));assertEquals(28,LinuxKeyMap.fromAndroid(AndroidInputInjector.mapKey(13,0)));}
+ @Test public void sideModifiersAndUnsupportedKeys(){assertEquals(113,AndroidInputInjector.mapKey(17,0));assertEquals(114,AndroidInputInjector.mapKey(17,16));assertEquals(0,AndroidInputInjector.mapKey(0xffff,0));assertEquals(30,LinuxKeyMap.fromAndroid(AndroidInputInjector.mapKey(65,0)));}
+ @Test public void resetRejectsQueuedPressesAndCloseRejectsLatePresses(){SequenceGate gate=new SequenceGate();gate.open(1);assertTrue(gate.accepts(1,4));gate.reset(1,5);assertFalse(gate.accepts(1,4));assertFalse(gate.accepts(1,5));assertTrue(gate.accepts(1,6));gate.reset(1,3);assertFalse(gate.accepts(1,5));gate.close(1);assertFalse(gate.accepts(1,999));}
+ @Test public void resetDoesNotInvalidateAnotherOwner(){SequenceGate gate=new SequenceGate();gate.open(1);gate.open(2);gate.reset(1,10);assertFalse(gate.accepts(1,9));assertTrue(gate.accepts(2,9));gate.clear();assertFalse(gate.accepts(2,11));}
+ @Test public void absoluteDragKeepsButtonAndMovementOnSameBackend(){MouseRoute route=new MouseRoute();assertTrue(route.useVirtual(true));route.beginAbsolute();route.button(1,false);assertFalse(route.useVirtual(true));assertEquals(0,route.beginAbsolute());route.button(1,true);assertFalse(route.useVirtual(true));route.reset();assertTrue(route.useVirtual(true));}
+ @Test public void switchingToAbsoluteTransfersHeldButtonsOnce(){MouseRoute route=new MouseRoute();route.button(1,false);route.button(3,false);assertEquals(5,route.beginAbsolute());assertEquals(0,route.beginAbsolute());assertFalse(route.useVirtual(true));}
+ @Test public void repeatedReadinessProbesDoNotReuseClosedIdentity(){ProbeSessions ids=new ProbeSessions();SequenceGate gate=new SequenceGate();int first=ids.next();gate.open(first);gate.close(first);int second=ids.next();assertTrue(second<first);assertTrue(second>0x40000000);gate.open(second);assertFalse(gate.accepts(first,1));assertTrue(gate.accepts(second,1));}
+}

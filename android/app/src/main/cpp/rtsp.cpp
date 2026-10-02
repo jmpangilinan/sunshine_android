@@ -30,6 +30,7 @@ extern "C" {
 #include "stream.h"
 #include "sync.h"
 #include "video.h"
+#include "sunshine.h"
 
 namespace asio = boost::asio;
 
@@ -403,7 +404,23 @@ namespace rtsp_stream {
       clear();
     }
 
+    void close() {
+      stopping = true;
+      boost::system::error_code ec;
+      acceptor.cancel(ec);
+      acceptor.close(ec);
+      if (next_socket) next_socket->sock.close(ec);
+      for (auto &weak : connections) if (auto socket = weak.lock()) socket->sock.close(ec);
+      io_context.restart();
+      io_context.poll();
+      io_context.restart();
+      next_socket.reset();
+      connections.clear();
+      launch_event.reset();
+    }
     int bind(net::af_e af, std::uint16_t port, boost::system::error_code &ec) {
+      stopping = false;
+      io_context.restart();
       acceptor.open(af == net::IPV4 ? tcp::v4() : tcp::v6(), ec);
       if (ec) {
         return -1;
@@ -438,6 +455,7 @@ namespace rtsp_stream {
     }
 
     void handle_msg(tcp::socket &sock, launch_session_t &session, msg_t &&req) {
+      if (stopping) return;
       auto func = _map_cmd_cb.find(req->message.request.command);
       if (func != std::end(_map_cmd_cb)) {
         func->second(this, sock, session, std::move(req));
@@ -450,6 +468,7 @@ namespace rtsp_stream {
     }
 
     void handle_accept(const boost::system::error_code &ec) {
+      if (stopping || !acceptor.is_open()) return;
       if (ec) {
         BOOST_LOG(error) << "Couldn't accept incoming connections: "sv << ec.message();
 
@@ -459,6 +478,7 @@ namespace rtsp_stream {
       }
 
       auto socket = std::move(next_socket);
+      connections.emplace_back(socket);
 
       auto launch_session {launch_event.view(0s)};
       if (launch_session) {
@@ -594,6 +614,8 @@ namespace rtsp_stream {
     tcp::acceptor acceptor {io_context};
 
     std::shared_ptr<socket_t> next_socket;
+    std::vector<std::weak_ptr<socket_t>> connections;
+    bool stopping = false;
   };
 
   rtsp_server_t server {};
@@ -1038,17 +1060,17 @@ namespace rtsp_stream {
       config.monitor.bitrate = configuredBitrateKbps;
     }
 
-    if (config.monitor.videoFormat == 1 && video::active_hevc_mode == 1) {
-      BOOST_LOG(warning) << "HEVC is disabled, yet the client requested HEVC"sv;
-
+    if (!sunshine_callbacks::supportsVideo(config.monitor) || config.audio.channels != 2 ||
+        config.audio.flags[audio::config_t::CUSTOM_SURROUND_PARAMS] ||
+        (config.audio.packetDuration != 5 && config.audio.packetDuration != 10 && config.audio.packetDuration != 20 &&
+         config.audio.packetDuration != 40 && config.audio.packetDuration != 60)) {
+      BOOST_LOG(warning) << "Unsupported hardware SDR420 video or stereo audio negotiation";
       respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
       return;
     }
-
-    if (config.monitor.videoFormat == 2 && video::active_av1_mode == 1) {
-      BOOST_LOG(warning) << "AV1 is disabled, yet the client requested AV1"sv;
-
-      respond(sock, session, &option, 400, "BAD REQUEST", req->sequenceNumber, {});
+    if (server->session_count() != 0) {
+      BOOST_LOG(warning) << "Projection already owns a streaming session";
+      respond(sock, session, &option, 453, "Not Enough Bandwidth", req->sequenceNumber, {});
       return;
     }
 
@@ -1101,11 +1123,11 @@ namespace rtsp_stream {
 
     boost::system::error_code ec;
     if (server.bind(net::af_from_enum_string(config::sunshine.address_family), net::map_port(rtsp_stream::RTSP_SETUP_PORT), ec)) {
-      BOOST_LOG(fatal) << "Couldn't bind RTSP server to port ["sv << net::map_port(rtsp_stream::RTSP_SETUP_PORT) << "], " << ec.message();
-      shutdown_event->raise(true);
-
+      sunshine_callbacks::hostStartupFailed("RTSP listener: " + ec.message());
+      server.close();
       return;
     }
+    sunshine_callbacks::hostListenerReady(1);
 
     while (!shutdown_event->peek()) {
       server.iterate(std::min(500ms, config::stream.ping_timeout));
@@ -1119,6 +1141,7 @@ namespace rtsp_stream {
     }
 
     server.clear();
+    server.close();
   }
 
   void print_msg(PRTSP_MESSAGE msg) {
