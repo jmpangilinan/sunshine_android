@@ -10,6 +10,7 @@
 #include <atomic>
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -50,6 +51,9 @@ struct Renderer {
     PFNEGLDESTROYIMAGEKHRPROC destroyImage = nullptr;
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC bindImage = nullptr;
     std::array<Import, 2> imports {};
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point reportAt = Clock::now();
+    uint64_t frames = 0, importMisses = 0, prepareNs = 0, drawNs = 0, waitNs = 0, waitMaxNs = 0;
     void clear(Import &i) {
         if (i.fbo) glDeleteFramebuffers(1, &i.fbo);
         if (i.texture) glDeleteTextures(1, &i.texture);
@@ -140,6 +144,7 @@ struct Renderer {
     }
     void render(AHardwareBuffer *buffer, const float *matrix, bool test) {
         require(buffer != nullptr, "Missing image hardware buffer");
+        auto started = Clock::now();
         AHardwareBuffer_Desc desc {}; AHardwareBuffer_describe(buffer, &desc);
         require((desc.usage & AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT) != 0, "Codec buffer lacks GPU output usage");
         if (test) __android_log_print(ANDROID_LOG_INFO, "SunshineCapture",
@@ -148,6 +153,7 @@ struct Renderer {
         Import *target = nullptr;
         for (auto &i : imports) if (i.buffer == buffer) target = &i;
         if (!target) {
+            if (!test) ++importMisses;
             for (auto &i : imports) if (!i.buffer) { target = &i; break; }
             if (!target) { target = &imports[0]; clear(*target); }
             target->buffer = buffer; AHardwareBuffer_acquire(buffer);
@@ -169,9 +175,11 @@ struct Renderer {
         glViewport(0, 0, desc.width, desc.height); glDisable(GL_BLEND); glDisable(GL_SCISSOR_TEST);
         glUseProgram(test ? probeProgram : program);
         if (!test) { glUniformMatrix4fv(transform, 1, GL_FALSE, matrix); glUniform1i(probe, GL_FALSE); }
+        auto prepared = Clock::now();
         glDrawArrays(GL_TRIANGLES, 0, 3); require(glGetError() == GL_NO_ERROR, "nativeYUV draw rejected (no fallback)");
         GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0); require(fence != nullptr, "GPU completion fence creation failed");
         glFlush();
+        auto submitted = Clock::now();
         auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
         bool completed = false;
         while (!cancelled.load() && std::chrono::steady_clock::now() < deadline) {
@@ -182,6 +190,24 @@ struct Renderer {
         glDeleteSync(fence);
         require(completed, cancelled.load() ? "Renderer cancelled" : "GPU completion fence timeout");
         require(glGetError() == GL_NO_ERROR, "nativeYUV completion error");
+        if (!test) {
+            auto finished = Clock::now();
+            auto nanos = [](auto duration) { return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count()); };
+            prepareNs += nanos(prepared - started);
+            drawNs += nanos(submitted - prepared);
+            auto waited = nanos(finished - submitted);
+            waitNs += waited; if (waited > waitMaxNs) waitMaxNs = waited;
+            ++frames;
+            if (finished - reportAt >= std::chrono::seconds(5)) {
+                __android_log_print(ANDROID_LOG_INFO, "SunshineCapture",
+                    "nativeYUV GPUstages frames=%llu imports=%llu prepareMeanUs=%llu drawMeanUs=%llu waitMeanUs=%llu waitMaxUs=%llu",
+                    static_cast<unsigned long long>(frames), static_cast<unsigned long long>(importMisses),
+                    static_cast<unsigned long long>(prepareNs / frames / 1000), static_cast<unsigned long long>(drawNs / frames / 1000),
+                    static_cast<unsigned long long>(waitNs / frames / 1000), static_cast<unsigned long long>(waitMaxNs / 1000));
+                frames = importMisses = prepareNs = drawNs = waitNs = waitMaxNs = 0;
+                reportAt = finished;
+            }
+        }
     }
 };
 Renderer *get(jlong handle) { return reinterpret_cast<Renderer *>(handle); }

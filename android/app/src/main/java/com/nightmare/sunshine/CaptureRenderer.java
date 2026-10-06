@@ -33,6 +33,8 @@ class CaptureRenderer {
 
     // Isolate API33 verification references from devices running minSdk26.
     private static final class Api33 extends CaptureRenderer {
+        // Overlap codec release with rendering; source frames remain latest-only and bounded.
+        static final int MAX_IN_FLIGHT = 4;
         final HandlerThread thread = new HandlerThread("sunshine-nativeYUV");
         final Handler handler;
         final AtomicBoolean cancelled = new AtomicBoolean();
@@ -45,13 +47,15 @@ class CaptureRenderer {
         boolean renderScheduled;
         final Runnable renderTask = () -> { renderScheduled = false; renderLatest(); };
         void scheduleLatest() {
-            if (!renderScheduled && pending && inFlight < 2 && !cancelled.get()) {
+            if (!renderScheduled && pending && inFlight < MAX_IN_FLIGHT && !cancelled.get()) {
                 renderScheduled = true;
                 handler.post(renderTask);
             }
         }
         long frames, notifications, ageSum, ageMax, previousTimestamp, cadenceSum, cadenceCount;
         long reportAt = System.nanoTime();
+        long updateNs, dequeueNs, acquireNs, renderNs, queueNs, releaseCount, blockedCallbacks;
+        long updateMaxNs, dequeueMaxNs, acquireMaxNs, renderMaxNs, queueMaxNs;
         Api33() { thread.start(); handler = new Handler(thread.getLooper()); }
         <T> T call(java.util.concurrent.Callable<T> operation) throws Exception {
             FutureTask<T> task = new FutureTask<>(operation);
@@ -76,7 +80,7 @@ class CaptureRenderer {
             source = new SurfaceTexture(nativeTexture(nativeHandle));
             source.setDefaultBufferSize(width, height);
             surface = new Surface(source);
-            writer = new android.media.ImageWriter.Builder(codec).setMaxImages(2)
+            writer = new android.media.ImageWriter.Builder(codec).setMaxImages(MAX_IN_FLIGHT)
                     .setWidthAndHeight(width, height)
                     .setUsage(android.hardware.HardwareBuffer.USAGE_GPU_COLOR_OUTPUT |
                               android.hardware.HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE |
@@ -91,15 +95,17 @@ class CaptureRenderer {
             writer.setOnImageReleasedListener(ignored -> {
                 if (cancelled.get()) return;
                 if (inFlight > 0) --inFlight;
+                ++releaseCount;
                 scheduleLatest();
             }, handler);
             source.setOnFrameAvailableListener(ignored -> {
                 if (cancelled.get()) return;
                 ++notifications;
                 pending = true;
+                if (inFlight >= MAX_IN_FLIGHT) ++blockedCallbacks;
                 scheduleLatest();
             }, handler);
-            Log.i(TAG, "captureMode=nativeYUV buffering=2 latestOnly=true defaultCodecFormat=true");
+            Log.i(TAG, "captureMode=nativeYUV buffering=" + MAX_IN_FLIGHT + " latestOnly=true defaultCodecFormat=true");
         }
         void acquire(android.media.Image image) throws java.io.IOException {
             try (android.hardware.SyncFence fence = image.getFence()) {
@@ -109,23 +115,38 @@ class CaptureRenderer {
             if (cancelled.get()) throw new IllegalStateException("Renderer cancelled");
         }
         void renderLatest() {
-            if (!pending || inFlight >= 2 || cancelled.get() || failure != null) return;
+            if (!pending || inFlight >= MAX_IN_FLIGHT || cancelled.get() || failure != null) return;
             android.media.Image image = null;
             try {
                 pending = false;
+                long stage = System.nanoTime();
                 source.updateTexImage();
                 source.getTransformMatrix(transform);
+                long elapsed = System.nanoTime() - stage;
+                updateNs += elapsed; updateMaxNs = Math.max(updateMaxNs, elapsed);
                 long timestamp = source.getTimestamp();
                 if (timestamp <= 0 || timestamp <= previousTimestamp) return;
-                image = writer.dequeueInputImage(); // At most two queued images, released callbacks admit reuse.
+                stage = System.nanoTime();
+                image = writer.dequeueInputImage(); // Released callbacks bound outstanding codec images.
+                elapsed = System.nanoTime() - stage;
+                dequeueNs += elapsed; dequeueMaxNs = Math.max(dequeueMaxNs, elapsed);
+                stage = System.nanoTime();
                 acquire(image);
+                elapsed = System.nanoTime() - stage;
+                acquireNs += elapsed; acquireMaxNs = Math.max(acquireMaxNs, elapsed);
+                stage = System.nanoTime();
                 try (android.hardware.HardwareBuffer buffer = image.getHardwareBuffer()) {
                     nativeRender(nativeHandle, buffer, transform, false);
                 }
+                elapsed = System.nanoTime() - stage;
+                renderNs += elapsed; renderMaxNs = Math.max(renderMaxNs, elapsed);
                 if (cancelled.get()) return;
                 image.setTimestamp(timestamp); // Preserve SurfaceTexture's original monotonic producer timestamp.
                 ++inFlight;
+                stage = System.nanoTime();
                 writer.queueInputImage(image);
+                elapsed = System.nanoTime() - stage;
+                queueNs += elapsed; queueMaxNs = Math.max(queueMaxNs, elapsed);
                 image = null;
                 long now = System.nanoTime(), age = now - timestamp;
                 if (age >= 0) { ageSum += age; ageMax = Math.max(ageMax, age); }
@@ -137,6 +158,14 @@ class CaptureRenderer {
                             + " ageMeanUs=" + (frames == 0 ? 0 : ageSum / frames / 1000)
                             + " ageMaxUs=" + ageMax / 1000 + " cadenceMeanUs="
                             + (cadenceCount == 0 ? 0 : cadenceSum / cadenceCount / 1000));
+                    Log.i(TAG, "nativeYUV stagesUs mean/max update=" + updateNs / frames / 1000 + "/" + updateMaxNs / 1000
+                            + " dequeue=" + dequeueNs / frames / 1000 + "/" + dequeueMaxNs / 1000
+                            + " acquire=" + acquireNs / frames / 1000 + "/" + acquireMaxNs / 1000
+                            + " render=" + renderNs / frames / 1000 + "/" + renderMaxNs / 1000
+                            + " queue=" + queueNs / frames / 1000 + "/" + queueMaxNs / 1000
+                            + " releases=" + releaseCount + " blockedCallbacks=" + blockedCallbacks);
+                    updateNs = dequeueNs = acquireNs = renderNs = queueNs = releaseCount = blockedCallbacks = 0;
+                    updateMaxNs = dequeueMaxNs = acquireMaxNs = renderMaxNs = queueMaxNs = 0;
                     frames = notifications = ageSum = ageMax = cadenceSum = cadenceCount = 0;
                     reportAt = now;
                 }
